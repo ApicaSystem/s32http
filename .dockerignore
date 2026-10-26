@@ -1,0 +1,9 @@
+.git
+.idea
+.circleci
+build/
+*.test
+*.out
+*.db
+*.png
+*.sketch
