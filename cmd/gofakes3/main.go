@@ -10,6 +10,7 @@ import (
 	httppprof "net/http/pprof"
 	"os"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
 	"github.com/johannesboyne/gofakes3/backend/s3afero"
@@ -49,11 +50,12 @@ type fakeS3Flags struct {
 	debugCPU  string
 	debugHost string
 
-	logiqHost     string
-	logiqPort     string
-	maxBatch      int
-	maxWorkers    int
-	logiqLogLevel string
+	logiqHost                 string
+	logiqPort                 string
+	maxBatch                  int
+	maxWorkers                int
+	maxObjectPropagationCount int
+	logiqLogLevel             string
 }
 
 func (f *fakeS3Flags) attach(flagSet *flag.FlagSet) {
@@ -77,6 +79,8 @@ func (f *fakeS3Flags) attach(flagSet *flag.FlagSet) {
 	flagSet.StringVar(&f.fsMeta, "fs.meta", "", "Optional path for storing S3 metadata for your buckets. Defaults to the '/metadata' subfolder of -fs.path if not passed.")
 	flagSet.IntVar(&f.maxBatch, "logiq.maxbatch", 25, "Maximum number of messages to batch before sending to Logiq")
 	flagSet.IntVar(&f.maxWorkers, "logiq.maxworkers", 100, "Maximum number of workers to use to send messages to Logiq")
+	flagSet.IntVar(&f.maxObjectPropagationCount, "apica.maxobjectpropagationcount", 1, "Maximum number of objects proxyable to apica in parallel")
+
 	flagSet.StringVar(&f.logiqHost, "logiq.host", "logiq-flash", "Logiq host to send messages to")
 	flagSet.StringVar(&f.logiqPort, "logiq.port", "9999", "Logiq port to send messages to")
 	flagSet.StringVar(&f.logiqLogLevel, "logiq.loglevel", "info", "Log level to use for Logiq messages")
@@ -121,11 +125,79 @@ func debugServer(host string) {
 	}
 }
 
+type apicaEnv struct {
+	maxBatch                  int
+	maxWorkers                int
+	maxObjectPropagationCount int
+	logiqHost                 string
+	logiqPort                 string
+	logiqLogLevel             string
+}
+
+func convertToValidInt(input string, defaultValue int) int {
+	if input == "" {
+		return defaultValue
+	}
+	intValue, err := strconv.Atoi(input)
+	if err != nil {
+		log.Printf("\ninvalid integer env value passed: %s. Error: %v\n", input, err)
+		return defaultValue
+	}
+	if intValue <= 0 {
+		return defaultValue
+	}
+	return intValue
+}
+
+var DEFAULT_MAX_BATCH_SIZE = 25
+var DEFAULT_MAX_WORKERS_COUNT = 100
+var DEFAULT_MAX_OBJECT_PROPAGATION_COUNT = 1
+var DEFAULT_LOG_LEVEL = "info"
+var DEFAULT_LOGIQ_HOST = "logiq-flash"
+var DEFAULT_LOGIQ_PORT = "9999"
+
+func readEnv() *apicaEnv {
+	env := &apicaEnv{}
+	s := os.Getenv("apica_s3_max_batch")
+	env.maxBatch = convertToValidInt(s, DEFAULT_MAX_BATCH_SIZE)
+
+	maxWorkers := os.Getenv("apica_s3_max_workers")
+	env.maxWorkers = convertToValidInt(maxWorkers, DEFAULT_MAX_WORKERS_COUNT)
+
+	maxObjectPropagationCount := os.Getenv("apica_s3_max_object_propagation_count")
+	env.maxObjectPropagationCount = convertToValidInt(maxObjectPropagationCount, DEFAULT_MAX_OBJECT_PROPAGATION_COUNT)
+
+	s = os.Getenv("apica_s3_logiq_host")
+	if s == "" {
+		env.logiqHost = DEFAULT_LOGIQ_HOST
+	} else {
+		env.logiqHost = s
+	}
+
+	s = os.Getenv("apica_s3_logiq_port")
+	if s == "" {
+		env.logiqPort = DEFAULT_LOGIQ_PORT
+	} else {
+		env.logiqPort = s
+	}
+
+	s = os.Getenv("apica_s3_log_level")
+	if s == "" {
+		env.logiqLogLevel = DEFAULT_LOG_LEVEL
+	} else {
+		env.logiqLogLevel = s
+	}
+
+	return env
+}
+
 func run() error {
 	var values fakeS3Flags
 
 	flagSet := flag.NewFlagSet("", 0)
 	values.attach(flagSet)
+
+	env := readEnv()
 
 	if err := flagSet.Parse(os.Args[1:]); err != nil {
 		return err
@@ -175,11 +247,12 @@ func run() error {
 			log.Println("no buckets available; consider passing -initialbucket")
 		}
 		backend = logiq.New(
-			logiq.WithLogLevel(values.logiqLogLevel),
-			logiq.WithLogiqHost(values.logiqHost),
-			logiq.WithLogiqPort(values.logiqPort),
-			logiq.WithMaxBatch(values.maxBatch),
-			logiq.WithMaxWorkers(values.maxWorkers),
+			logiq.WithLogLevel(env.logiqLogLevel),
+			logiq.WithLogiqHost(env.logiqHost),
+			logiq.WithLogiqPort(env.logiqPort),
+			logiq.WithMaxBatch(env.maxBatch),
+			logiq.WithMaxWorkers(env.maxWorkers),
+			logiq.WithMaxObjectPropagationCount(env.maxObjectPropagationCount),
 			logiq.WithTimeSource(timeSource))
 		log.Println("using logiq backend")
 

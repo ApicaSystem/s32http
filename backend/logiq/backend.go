@@ -7,9 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	gofakes3 "github.com/logiqai/s32http"
-	"github.com/logiqai/s32http/internal/goskipiter"
-	"github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -17,6 +14,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	gofakes3 "github.com/logiqai/s32http"
+	"github.com/logiqai/s32http/internal/goskipiter"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -27,17 +28,19 @@ var (
 )
 
 type Backend struct {
-	buckets          map[string]*bucket
-	timeSource       gofakes3.TimeSource
-	versionGenerator *versionGenerator
-	versionSeed      int64
-	versionSeedSet   bool
-	versionScratch   []byte
-	lock             sync.RWMutex
-	logiqHost        string
-	logiqPort        string
-	maxWorkers       int
-	maxBatch         int
+	buckets                   map[string]*bucket
+	timeSource                gofakes3.TimeSource
+	versionGenerator          *versionGenerator
+	versionSeed               int64
+	versionSeedSet            bool
+	versionScratch            []byte
+	lock                      sync.RWMutex
+	logiqHost                 string
+	logiqPort                 string
+	maxWorkers                int
+	maxBatch                  int
+	maxObjectPropagationCount int
+	proxySlots                chan struct{}
 }
 
 var _ gofakes3.Backend = &Backend{}
@@ -49,23 +52,32 @@ func WithTimeSource(timeSource gofakes3.TimeSource) Option {
 	return func(b *Backend) { b.timeSource = timeSource }
 }
 
+func WithMaxObjectPropagationCount(maxObjectPropagationCount int) Option {
+	log.Infoln("Setting max object propagation count to", maxObjectPropagationCount)
+	if maxObjectPropagationCount <= 0 {
+		maxObjectPropagationCount = 1
+	}
+	return func(b *Backend) { b.maxObjectPropagationCount = maxObjectPropagationCount }
+
+}
+
 func WithMaxWorkers(maxWorkers int) Option {
-	log.Infoln("Setting max workers to ", maxWorkers)
+	log.Infoln("Setting max workers to", maxWorkers)
 	return func(b *Backend) { b.maxWorkers = maxWorkers }
 }
 
 func WithMaxBatch(maxBatch int) Option {
-	log.Infoln("Setting max batch to ", maxBatch)
+	log.Infoln("Setting max batch to", maxBatch)
 	return func(b *Backend) { b.maxBatch = maxBatch }
 }
 
 func WithLogiqHost(host string) Option {
-	log.Infoln("Setting logiq host to ", host)
+	log.Infoln("Setting logiq host to", host)
 	return func(b *Backend) { b.logiqHost = host }
 }
 
 func WithLogiqPort(port string) Option {
-	log.Infoln("Setting logiq port to ", port)
+	log.Infoln("Setting logiq port to", port)
 	return func(b *Backend) { b.logiqPort = port }
 }
 
@@ -111,6 +123,7 @@ func New(opts ...Option) *Backend {
 			b.versionGenerator = newVersionGenerator(uint64(b.timeSource.Now().UnixNano()), 0)
 		}
 	}
+	b.proxySlots = make(chan struct{}, b.maxObjectPropagationCount)
 	return b
 }
 
@@ -316,6 +329,8 @@ func (db *Backend) PutObjectOrig(bucketName, objectName string, meta map[string]
 }
 
 func (db *Backend) SendToLogiq(bts []byte) error {
+	db.waitForProxySlot()
+	defer db.emptyProxySlot()
 	m := []map[string]interface{}{}
 	err := json.Unmarshal(bts, &m)
 	if err != nil {
@@ -373,6 +388,16 @@ func (db *Backend) SendToLogiq(bts []byte) error {
 	}
 }
 
+func (db *Backend) emptyProxySlot() {
+	if len(db.proxySlots) > 0 {
+		<-db.proxySlots
+	}
+}
+
+func (db *Backend) waitForProxySlot() {
+	db.proxySlots <- struct{}{}
+}
+
 func (db *Backend) SendToLogiqSingleBatch(bts []byte) error {
 	logiqClient := &http.Client{}
 	logiqURL := fmt.Sprintf("http://%s:%s/v1/json_batch", db.logiqHost, db.logiqPort)
@@ -420,38 +445,17 @@ func (db *Backend) PutObject(bucketName, objectName string, meta map[string]stri
 		return result, err
 	}
 
-	db.lock.Lock()
-	defer db.lock.Unlock()
-
+	db.lock.RLock()
 	bucket := db.buckets[bucketName]
+	db.lock.RUnlock()
 	if bucket == nil {
 		return result, gofakes3.BucketNotFound(bucketName)
 	}
-
-	hash := md5.Sum(bts)
-
-	item := &bucketData{
-		name:         objectName,
-		body:         bts,
-		hash:         hash[:],
-		etag:         `"` + hex.EncodeToString(hash[:]) + `"`,
-		metadata:     meta,
-		lastModified: db.timeSource.Now(),
-	}
-
-	//
-	// bucket.put(objectName, item)
-	// We will hijack this and send over data to the logiq server
 
 	retval := db.SendToLogiq(bts)
 	if retval != nil {
 		log.Printf("Error sending to logiq: %v", retval)
 		return result, retval
-	}
-
-	if bucket.versioning == gofakes3.VersioningEnabled {
-		// versionID is assigned in bucket.put()
-		result.VersionID = item.versionID
 	}
 
 	return result, nil
