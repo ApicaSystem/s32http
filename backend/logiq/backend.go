@@ -2,6 +2,7 @@ package logiq
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +13,10 @@ import (
 	"github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +41,19 @@ type Backend struct {
 	logiqPort        string
 	maxWorkers       int
 	maxBatch         int
+	retryBudget      time.Duration
+	attemptTimeout   time.Duration
+	backoffBase      time.Duration
+	backoffMax       time.Duration
+	delivered        *ledger
 }
+
+// Splunk's S3 client abandons a PUT that has had no response for 60s and
+// retries it, so every PUT is answered within this budget.
+const defaultRetryBudget = 45 * time.Second
+
+// Flash asks for 1-5s; a longer Retry-After is honoured only up to this.
+const maxRetryAfter = 10 * time.Second
 
 var _ gofakes3.Backend = &Backend{}
 var _ gofakes3.VersionedBackend = &Backend{}
@@ -96,7 +111,13 @@ func WithVersionSeed(seed int64) Option {
 
 func New(opts ...Option) *Backend {
 	b := &Backend{
-		buckets: make(map[string]*bucket),
+		buckets:        make(map[string]*bucket),
+		retryBudget:    defaultRetryBudget,
+		attemptTimeout: 20 * time.Second,
+		backoffBase:    250 * time.Millisecond,
+		backoffMax:     4 * time.Second,
+		// Splunk retries a failed object at most about 6 minutes apart.
+		delivered: newLedger(15*time.Minute, 50000),
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -315,15 +336,36 @@ func (db *Backend) PutObjectOrig(bucketName, objectName string, meta map[string]
 	return result, nil
 }
 
-func (db *Backend) SendToLogiq(bts []byte) error {
+// SendToLogiq sends the events of an S3 object to logiq in batches, retrying
+// failed batches until deadline. key names the object and its content:
+// batches already accepted for the same key are not sent again.
+func (db *Backend) SendToLogiq(key string, bts []byte, deadline time.Time) error {
 	m := []map[string]interface{}{}
 	err := json.Unmarshal(bts, &m)
 	if err != nil {
 		return err
 	}
+	nBatches := (len(m) + db.maxBatch - 1) / db.maxBatch
+	entry := db.delivered.acquire(key, db.maxBatch, nBatches, db.timeSource.Now())
+	defer func() { db.delivered.release(entry, db.timeSource.Now()) }()
+	pending := 0
+	for _, done := range entry.done {
+		if !done {
+			pending++
+		}
+	}
+	if pending < nBatches {
+		log.Infof("%s: %d of %d batches already delivered, sending %d", key, nBatches-pending, nBatches, pending)
+	}
+
+	send := &objectSend{db: db, key: key, nBatches: nBatches, deadline: deadline}
+	send.stop, send.abort = context.WithCancel(context.Background())
+	defer send.abort()
+
 	ch := make(chan bool, db.maxWorkers)
 	wg := sync.WaitGroup{}
-	retErrors := sync.Map{}
+	errs := make([]error, nBatches)
+	sizes := make([]int, nBatches)
 	cluster, clusterExists := os.LookupEnv("service_name")
 	namespace := "s2s"
 	if !clusterExists {
@@ -335,6 +377,11 @@ func (db *Backend) SendToLogiq(bts []byte) error {
 			j = len(m)
 		}
 		batch := m[i:j]
+		n := i / db.maxBatch
+		sizes[n] = len(batch)
+		if entry.done[n] {
+			continue
+		}
 		for _, batchItem := range batch {
 			batchItem["namespace"] = namespace
 			batchItem["cluster_id"] = cluster
@@ -348,41 +395,162 @@ func (db *Backend) SendToLogiq(bts []byte) error {
 			return err
 		}
 		ch <- true
+		var skip error
+		if send.stop.Err() != nil {
+			skip = errors.New("not sent, logiq refused the object")
+		} else if !time.Now().Before(deadline) {
+			skip = errors.New("not sent, out of time")
+		}
+		if skip != nil {
+			<-ch
+			errs[n] = skip
+			continue
+		}
 		wg.Add(1)
 		go func(wgPtr *sync.WaitGroup, index int, batchBytes []byte, doneCh chan bool) {
 			defer func() {
 				<-ch
 				wgPtr.Done()
 			}()
-			sendErr := db.SendToLogiqSingleBatch(batchBytes)
-			if sendErr != nil {
-				retErrors.Store(index, sendErr)
-			}
-		}(&wg, i, b, ch)
+			errs[index] = send.batch(index, sizes[index], batchBytes)
+		}(&wg, n, b, ch)
 	}
 	wg.Wait()
-	allerrors := []string{}
-	retErrors.Range(func(key, value interface{}) bool {
-		allerrors = append(allerrors, value.(error).Error())
-		return true
-	})
-	if len(allerrors) > 0 {
-		return errors.New(strings.Join(allerrors, ","))
-	} else {
-		return nil
+	failed, failedEvents := 0, 0
+	var firstErr error
+	for n, err := range errs {
+		if err == nil {
+			entry.done[n] = true
+			continue
+		}
+		failed++
+		failedEvents += sizes[n]
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d batches (%d events) not delivered, first error: %v", failed, nBatches, failedEvents, firstErr)
+	}
+	return nil
+}
+
+// objectSend is one PUT's attempt at sending the batches of an object.
+type objectSend struct {
+	db       *Backend
+	key      string
+	nBatches int
+	deadline time.Time
+	// stop is cancelled when logiq refuses the object outright (bad token,
+	// wrong route): the remaining batches are not sent and retries end.
+	stop       context.Context
+	abort      context.CancelFunc
+	warnOnce   sync.Once
+	refuseOnce sync.Once
+}
+
+// batch sends batch n, retrying 429, 5xx and transport errors until the
+// deadline. A batch logiq can never accept (400, 413) is dropped and counts
+// as delivered, so it does not hold up the object.
+func (s *objectSend) batch(n, events int, bts []byte) error {
+	desc := fmt.Sprintf("%s batch %d/%d (%d events)", s.key, n+1, s.nBatches, events)
+	start := time.Now()
+	lastResponse := ""
+	for attempt := 1; ; attempt++ {
+		attemptDeadline := time.Now().Add(s.db.attemptTimeout)
+		if s.deadline.Before(attemptDeadline) {
+			attemptDeadline = s.deadline
+		}
+		ctx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
+		status, body, retryAfter, err := s.db.SendToLogiqSingleBatch(ctx, bts)
+		cancel()
+
+		outcome := fmt.Sprintf("status %d, body %q", status, truncate(body, 1024))
+		if err != nil {
+			outcome = err.Error()
+		} else {
+			lastResponse = outcome
+		}
+		switch {
+		case err == nil && status/100 == 2:
+			return nil
+		case err == nil && (status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge):
+			log.Errorf("Dropping %s, logiq will never accept it: %s", desc, outcome)
+			return nil
+		case err == nil && status != http.StatusTooManyRequests && status/100 != 5:
+			s.refuseOnce.Do(func() { log.Errorf("Not sending %s or the rest of the object: %s", desc, outcome) })
+			s.abort()
+			return errors.New(outcome)
+		}
+
+		log.Debugf("Attempt %d of %s failed: %s", attempt, desc, outcome)
+		s.warnOnce.Do(func() { log.Warnf("Retrying %s: %s", desc, outcome) })
+		wait := s.db.backoff(attempt, retryAfter)
+		if time.Now().Add(wait).After(s.deadline) {
+			// The last attempt may have been cut short by the deadline;
+			// what logiq last answered is what explains the failure.
+			if err != nil && lastResponse != "" {
+				outcome += "; last response from logiq: " + lastResponse
+			}
+			// PutObject logs the failed PUT once, with this error.
+			log.Debugf("Giving up on %s after %d attempts in %v: %s", desc, attempt, time.Since(start).Round(time.Millisecond), outcome)
+			return errors.New(outcome)
+		}
+		select {
+		case <-s.stop.Done():
+			return errors.New(outcome)
+		case <-time.After(wait):
+		}
 	}
 }
 
-func (db *Backend) SendToLogiqSingleBatch(bts []byte) error {
+// backoff is how long to wait before the next attempt: exponential with full
+// jitter, and at least as long as logiq asked for in Retry-After.
+func (db *Backend) backoff(attempt int, retryAfter time.Duration) time.Duration {
+	ceiling := db.backoffBase
+	for i := 1; i < attempt && ceiling < db.backoffMax; i++ {
+		ceiling *= 2
+	}
+	if ceiling > db.backoffMax {
+		ceiling = db.backoffMax
+	}
+	wait := time.Duration(rand.Int63n(int64(ceiling))) + 1
+	if retryAfter > wait {
+		wait = retryAfter
+	}
+	return wait
+}
+
+func parseRetryAfter(h http.Header) time.Duration {
+	secs, err := strconv.Atoi(h.Get("Retry-After"))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	if d := time.Duration(secs) * time.Second; d < maxRetryAfter {
+		return d
+	}
+	return maxRetryAfter
+}
+
+func truncate(b []byte, max int) string {
+	if len(b) > max {
+		return string(b[:max]) + "..."
+	}
+	return string(b)
+}
+
+// SendToLogiqSingleBatch makes one attempt at posting a batch and returns
+// logiq's status, body and Retry-After, or the transport error.
+func (db *Backend) SendToLogiqSingleBatch(ctx context.Context, bts []byte) (int, []byte, time.Duration, error) {
 	logiqClient := &http.Client{}
 	logiqURL := fmt.Sprintf("http://%s:%s/v1/json_batch", db.logiqHost, db.logiqPort)
 	logiqClient.Timeout = time.Second * 60
 	token, exists := os.LookupEnv("x_api_key")
 
-	req, reqErr := http.NewRequest("POST", logiqURL, bytes.NewBuffer(bts))
+	req, reqErr := http.NewRequestWithContext(ctx, "POST", logiqURL, bytes.NewBuffer(bts))
 	if reqErr != nil {
 		log.Errorf("Error creating request: %v", reqErr)
-		return reqErr
+		return 0, nil, 0, reqErr
 	}
 	if exists {
 		req.Header.Add("Content-type", "application/json")
@@ -392,18 +560,18 @@ func (db *Backend) SendToLogiqSingleBatch(bts []byte) error {
 	}
 	resp, respErr := logiqClient.Do(req)
 	if respErr != nil {
-		log.Errorf("Error sending to logiq: %v", respErr)
-		return respErr
-	} else {
-		body, bodyErr := ioutil.ReadAll(resp.Body)
-		if bodyErr != nil {
-			log.Errorf("Error reading response from logiq: %v", bodyErr)
-			return bodyErr
-		} else {
-			log.Debugf("Response from logiq: %v", string(body))
-		}
+		return 0, nil, 0, respErr
 	}
-	return nil
+	defer resp.Body.Close()
+	// The status decides the outcome: a 2xx whose body cannot be read was
+	// still accepted, and retrying it would duplicate the batch.
+	body, bodyErr := ioutil.ReadAll(resp.Body)
+	if bodyErr != nil {
+		log.Debugf("Error reading response from logiq: %v", bodyErr)
+	} else {
+		log.Debugf("Response from logiq: %v", string(body))
+	}
+	return resp.StatusCode, body, parseRetryAfter(resp.Header), nil
 }
 
 func (db *Backend) PutObject(bucketName, objectName string, meta map[string]string, input io.Reader, size int64) (result gofakes3.PutObjectResult, err error) {
@@ -414,6 +582,9 @@ func (db *Backend) PutObject(bucketName, objectName string, meta map[string]stri
 	if err != nil {
 		return result, err
 	}
+	// Splunk's 60s wait for our answer starts once it has sent the body, so
+	// the budget runs from here, including any wait for the lock below.
+	deadline := time.Now().Add(db.retryBudget)
 
 	err = gofakes3.MergeMetadata(db, bucketName, objectName, meta)
 	if err != nil {
@@ -443,9 +614,9 @@ func (db *Backend) PutObject(bucketName, objectName string, meta map[string]stri
 	// bucket.put(objectName, item)
 	// We will hijack this and send over data to the logiq server
 
-	retval := db.SendToLogiq(bts)
+	retval := db.SendToLogiq(bucketName+"/"+objectName+"/"+hex.EncodeToString(hash[:]), bts, deadline)
 	if retval != nil {
-		log.Printf("Error sending to logiq: %v", retval)
+		log.Errorf("Error sending %s/%s to logiq, failing the PUT so Splunk retries it: %v", bucketName, objectName, retval)
 		return result, retval
 	}
 
