@@ -99,6 +99,7 @@ func newTestBackend(t *testing.T, f *fakeFlash, opts ...Option) *Backend {
 	b := New(opts...)
 	b.retryBudget = 300 * time.Millisecond
 	b.attemptTimeout = 200 * time.Millisecond
+	b.minAttempt = 100 * time.Millisecond
 	b.backoffBase = time.Millisecond
 	b.backoffMax = 5 * time.Millisecond
 	if err := b.CreateBucket("lq"); err != nil {
@@ -298,6 +299,66 @@ func TestPutObjectOutOfBudgetLogsOneError(t *testing.T) {
 	if !logs.hasError("429", "rate limited") {
 		t.Error("the error does not carry the status and body flash answered")
 	}
+}
+
+// slowFlash accepts every batch after delay, and records it even when the
+// client has given up waiting, as flash does once it has started publishing.
+func slowFlash(t *testing.T, delay func() time.Duration) *fakeFlash {
+	return newFakeFlash(t, func(int, []string, http.ResponseWriter) int {
+		time.Sleep(delay())
+		return http.StatusOK
+	})
+}
+
+func TestPutObjectDoesNotStartBatchWithTooLittleTimeLeft(t *testing.T) {
+	var mu sync.Mutex
+	delay := 120 * time.Millisecond
+	f := slowFlash(t, func() time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return delay
+	})
+	b := newTestBackend(t, f, WithMaxWorkers(1))
+	obj := object("e", 35)
+
+	// Batches 1 and 2 take 240ms of the 300ms budget, leaving batch 3 less
+	// than the 100ms minimum attempt.
+	if err := put(b, "obj", obj); err == nil {
+		t.Fatal("first PutObject succeeded although flash was too slow for the budget")
+	}
+	mu.Lock()
+	delay = 0
+	mu.Unlock()
+	if err := put(b, "obj", obj); err != nil {
+		t.Fatalf("retried PutObject: %v", err)
+	}
+	// Wait for any request the first PUT gave up on.
+	f.srv.Close()
+	assertEachDelivered(t, f, "e", 35, 1)
+}
+
+func TestPutObjectDoesNotRetryBatchWithTooLittleTimeLeft(t *testing.T) {
+	start := time.Now()
+	f := newFakeFlash(t, func(int, []string, http.ResponseWriter) int {
+		// Unavailable for 250ms of the 300ms budget, then slow to accept.
+		if time.Since(start) < 250*time.Millisecond {
+			return http.StatusServiceUnavailable
+		}
+		time.Sleep(150 * time.Millisecond)
+		return http.StatusOK
+	})
+	b := newTestBackend(t, f)
+	obj := object("e", 5)
+
+	if err := put(b, "obj", obj); err == nil {
+		t.Fatal("first PutObject succeeded although flash was unavailable for the budget")
+	}
+	if err := put(b, "obj", obj); err != nil {
+		t.Fatalf("retried PutObject: %v", err)
+	}
+	// Wait for any request the first PUT gave up on.
+	f.srv.Close()
+	assertEachDelivered(t, f, "e", 5, 1)
 }
 
 func TestPutObjectFailsFastOnAuthAndRoutingErrors(t *testing.T) {

@@ -43,6 +43,7 @@ type Backend struct {
 	maxBatch         int
 	retryBudget      time.Duration
 	attemptTimeout   time.Duration
+	minAttempt       time.Duration
 	backoffBase      time.Duration
 	backoffMax       time.Duration
 	delivered        *ledger
@@ -116,6 +117,9 @@ func New(opts ...Option) *Backend {
 		attemptTimeout: 20 * time.Second,
 		backoffBase:    250 * time.Millisecond,
 		backoffMax:     4 * time.Second,
+		// An attempt cut off by the deadline may still be accepted by logiq,
+		// and Splunk's retry would then send it again.
+		minAttempt: 5 * time.Second,
 		// Splunk retries a failed object at most about 6 minutes apart.
 		delivered: newLedger(15*time.Minute, 50000),
 	}
@@ -398,7 +402,7 @@ func (db *Backend) SendToLogiq(key string, bts []byte, deadline time.Time) error
 		var skip error
 		if send.stop.Err() != nil {
 			skip = errors.New("not sent, logiq refused the object")
-		} else if !time.Now().Before(deadline) {
+		} else if deadline.Sub(time.Now()) < db.minAttempt {
 			skip = errors.New("not sent, out of time")
 		}
 		if skip != nil {
@@ -486,7 +490,7 @@ func (s *objectSend) batch(n, events int, bts []byte) error {
 		log.Debugf("Attempt %d of %s failed: %s", attempt, desc, outcome)
 		s.warnOnce.Do(func() { log.Warnf("Retrying %s: %s", desc, outcome) })
 		wait := s.db.backoff(attempt, retryAfter)
-		if time.Now().Add(wait).After(s.deadline) {
+		if time.Now().Add(wait + s.db.minAttempt).After(s.deadline) {
 			// The last attempt may have been cut short by the deadline;
 			// what logiq last answered is what explains the failure.
 			if err != nil && lastResponse != "" {
